@@ -1,0 +1,249 @@
+#/usr/bin/python
+##https://sammchardy.github.io/async-binance-basics/
+##https://python-binance.readthedocs.io/en/latest/
+'''
+SUMMARY:
+Currently utilizes a common day trading strategy of tracking 3 periods of EMAs to predict upswings. EMAs are calculated directly from binance and tnd to calculate faster than their websites chart. 
+
+EMAs are pulled from binance API and calculated using TALIB EMA function
+
+Pricing info is pulled from binance API
+
+'Purchases' are done via binance testnet.
+
+THIS IS A WORK IN PROGRESS
+
+================================================================
+
+TO DO:
+-ADD PROFIT MARGIN SELLOFF, WILL NOT BE PROFITABLE UNTIL THIS HAS BEEN DONE
+-test with other cryptos
+    ~should be universal now?
+-test for TALIB/TAAPI to see which does better
+-add bullish candlestick check before buying maybe
+-implement more strategies
+-machine learning?
+-run tests for profitablity and tweak
+-remove prints
+
+'''
+#async api queries
+import asyncio
+
+#binance queries
+import binance
+from binance.client import Client
+from binance.enums import *
+
+# #for ema queries
+# import requests 
+
+#####---MAYBE REMOVE LATER
+#literally only for sleep
+import time
+
+#literally just for time stamp, maybe replace with time
+import datetime
+
+#for importing sensitive API keys
+import os
+from dotenv import load_dotenv
+
+#for Binance float wierdness
+import math
+
+#for calculating EMAs
+import numpy as np
+from talib import *
+
+#imports .env files
+load_dotenv()
+
+#keys and connections using keys
+# key = os.getenv('KEY')
+# secret = os.getenv('SEC')
+# client = Client(key, secret, tld='us')
+
+#testnet creds and setting testnet
+tkey = os.getenv('TKEY')
+tsecret = os.getenv('TSEC')
+tclient = Client(tkey, tsecret)
+tclient.API_URL = 'https://testnet.binance.vision/api'
+
+#crypto so easily changed
+crypto = 'BTC'
+
+#binance only supports up to certain decimal places with accuracy so this sets that requirement
+minqty = ((tclient.get_symbol_info(f'{crypto}usdt').get('filters')[2].get('minQty')).rstrip('0').count('0')) 
+# minqty = (tclient.get_symbol_info(f'{crypto}usdt').get('filters')[2].get('minQty'))
+
+#creates value started with for tracking purposes
+if float(tclient.get_asset_balance(asset='USDT').get('free')) < 50.0:
+    crypbal = float(tclient.get_asset_balance(asset=crypto).get('free'))
+    price = float(tclient.get_symbol_ticker(symbol=f"{crypto}USDT").get('price'))
+    USDTst = crypbal * price
+else:
+    USDTst = float(tclient.get_asset_balance(asset='USDT').get('free'))
+
+#truncate decimals to designated dec place length because binance only supports 6
+def truncate(number, digits) -> float:
+    stepper = 10.0 ** digits
+    return math.trunc(stepper * number) / stepper
+
+
+
+
+#async main for simultaneous api queries
+async def main(crypto):
+    
+    #new self calculated EMAs
+    async def getema(interval, crypto):
+        retlist = []
+        kline = np.float_(tclient.get_historical_klines(f'{crypto}USDT', Client.KLINE_INTERVAL_1MINUTE, f"{interval} min ago UTC"))
+        retlist.append([l[4] for l in kline])
+        return EMA(np.array(retlist[0]), interval)[-1]
+
+    
+    #pulls ema from TAAPI
+#     async def getema(interval, crypto):
+#         # Define endpoint - 127 running nodejs api interface
+#         endpoint = 'http://localhost:4101/indicator'
+        
+#         # Define a parameters dict for the parameters to be sent to the API 
+#         #more info in TAAPI documentation
+#         parameters = {
+#             'indicator': 'zlema',
+#             'exchange': 'binance',
+#             'symbol': f'{crypto}/USDT',
+#             'interval': f'{interval}m',
+#             'period': '50'
+#             } 
+
+#         # Send get request and save the response as response object 
+#         response = requests.get(url = endpoint, params = parameters)
+        
+#         # Extract data in json format 
+#         return response.json() 
+    
+    
+    #gets ema for period specified
+    ema3 = await asyncio.create_task(getema(3, crypto))
+    ema6 = await asyncio.create_task(getema(6, crypto))
+    ema9 = await asyncio.create_task(getema(9, crypto))
+    
+    emalist = [ema3, ema6, ema9]
+    
+    retlist = []
+    
+    for i in emalist:
+        if not np.isnan(i):
+            retlist.append(truncate(float(i), 2))
+        else: retlist.append(i)
+    return retlist
+
+
+   
+
+#sim buy function on binancetestnet
+def order():
+    
+    ema = asyncio.run(main(crypto))
+    
+    try:
+
+        print(f'{ema}\t buy @ {(tclient.get_symbol_ticker(symbol=f"{crypto}USDT").get("price"))}\n')
+        
+        #pulls price from binance api and buys from testnet
+        price = float(tclient.get_symbol_ticker(symbol=f"{crypto}USDT").get('price'))
+        balance = float((tclient.get_asset_balance(asset='USDT').get('free')))
+        quan = balance / (price + 25)
+        quant = '{:0.0{}f}'.format((truncate(quan, minqty)), minqty)
+        print(f'{quant}\t{quan}')
+        
+        tclient.order_market_buy(symbol=f'{crypto}USDT', quantity=quant) 
+        buyprice = float(tclient.get_symbol_ticker(symbol=f"{crypto}USDT").get('price'))
+
+        #SL/TP other cancels other order
+        balance = (tclient.get_asset_balance(asset='USDT').get('free'))
+        order = tclient.create_oco_order(
+        symbol=f'USDT{crypto}',
+        side=SIDE_SELL,
+        stopLimitTimeInForce=TIME_IN_FORCE_GTC,
+        stopPrice=f'{(quant * buyprice) * 0.98 }',
+        price=f'{(quant * buyprice) * 1.05}')
+
+    except:
+        print(f"An exception occurred during order()\n{err=}")
+
+            
+            
+
+#waits for emas to either rise or fall    
+def wait(waitfor):
+    
+    ema = asyncio.run(main(crypto))
+    
+    if waitfor == "buy":
+
+        #loop for waiting
+        while (ema[1] > ema[0] or ema[0] < ema[2]) or np.isnan(ema).any():
+
+            #pulls ema by running async main
+            ema = asyncio.run(main(crypto))
+            
+            
+            #remove once working
+            print(f'hold/wait to {waitfor} \t {ema}\n')
+            
+            #sleep due to binance update intervals
+            time.sleep(1)
+            
+            
+    #SELLWAIT
+    elif waitfor == "sell":
+        
+        #loop for waiting
+        while len(tclient.get_open_orders()) != 0:
+            
+            #remove once working
+            print(f'waiting for TP/SL to complete')
+            
+            #sleep due to api query limitations
+            time.sleep(3)
+
+        
+
+#loop to run actions continuously
+while True:
+    #waits for emas to cross to buy
+    wait('buy')
+
+    #buy action
+    order()
+
+    #sleep to stop spam buy/sell -- not a great solution
+    time.sleep(3)
+
+        #waits for emas to cross again to sell
+    wait('sell')
+
+
+    
+#START USDT 310.36
+
+    # account = tclient.get_account()                
+    # balance = float((tclient.get_asset_balance(asset='USDT').get('free'))
+    # print(balance)                 
+                    
+                    
+# from datetime import datetime
+# list =[] 
+# usd = float((tclient.get_asset_balance(asset='USDT').get('free')))
+# btc = float((tclient.get_asset_balance(asset=crypto).get('free')))
+# print(f'{btc}\n{usd}\n\n')
+
+# trans = tclient.get_all_orders(symbol='BTCUSDT', limit=1)[0]
+# date = (datetime.fromtimestamp(int(trans.get('time'))/1000))
+# update = (datetime.fromtimestamp(int(trans.get('time'))/1000))
+# trans.update({'time': f'{date}', 'updateTime': f'{update}'})
+# print(f'{date}\n{trans}')
